@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {uid}
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required)
+    //   - displayName: string (optional)
+    //   - photoURL: string (optional)
+    //   - role: string (required, enum: ['user', 'admin'])
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: documents
+    // Document ID: {docId}
+    // Fields:
+    //   - ownerId: string (required)
+    //   - title: string (required)
+    //   - type: string (required)
+    //   - content: string (required)
+    //   - metadata: map (optional)
+    //   - createdAt: timestamp (required)
+    //   - updatedAt: timestamp (required)
+    //
+    // Collection: projects
+    // Document ID: {projectId}
+    // Fields:
+    //   - ownerId: string (required)
+    //   - topic: string (required)
+    //   - level: string (required)
+    //   - chapters: map (required)
+    //   - createdAt: timestamp (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.ownerId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "micheal.onos@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
+             data.uid is string &&
+             data.email is string &&
+             data.role in ['user', 'admin'] &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidDocument(data) {
+      return data.keys().hasAll(['ownerId', 'title', 'type', 'content', 'createdAt', 'updatedAt']) &&
+             data.ownerId == request.auth.uid &&
+             data.title is string && data.title.size() < 200 &&
+             data.type is string &&
+             data.content is string && data.content.size() < 1000000 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['ownerId', 'topic', 'level', 'chapters', 'createdAt']) &&
+             data.ownerId == request.auth.uid &&
+             data.topic is string && data.topic.size() < 500 &&
+             data.level in ['ND', 'HND', 'BSc', 'MSc'] &&
+             data.chapters is map &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid) && isValidUser(request.resource.data) && request.resource.data.role == 'user';
+      allow update: if (isOwner(uid) && isValidUser(request.resource.data) && request.resource.data.role == resource.data.role) || isAdmin();
+    }
+
+    match /documents/{docId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && isValidDocument(request.resource.data);
+      allow update: if isDocOwner() && isValidDocument(request.resource.data);
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && isValidProject(request.resource.data);
+      allow update: if isDocOwner() && isValidProject(request.resource.data);
+      allow delete: if isDocOwner() || isAdmin();
+    }
+  }
+}

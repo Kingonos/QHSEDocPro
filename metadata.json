@@ -1,0 +1,9 @@
+{
+  "name": "QHSEDocsPro",
+  "description": "Professional QHSE Consultant, Academic Writer, and Document Editing Specialist platform with Admin Dashboard, Permit to Work, and Enhanced PDF tools.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
