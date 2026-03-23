@@ -21,7 +21,9 @@ import {
   doc,
   getDoc,
   setDoc,
-  getDocFromServer
+  getDocFromServer,
+  orderBy,
+  getDocs
 } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { 
@@ -37,7 +39,8 @@ import {
   Loader2,
   ShieldCheck,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -72,6 +75,7 @@ interface UserProfile {
   email: string;
   displayName: string;
   role: 'user' | 'admin';
+  permissions?: string[];
   createdAt: any;
 }
 
@@ -160,11 +164,17 @@ export default function App() {
   const [activeService, setActiveService] = useState<Service>('Dashboard');
   const [documents, setDocuments] = useState<SavedDoc[]>([]);
   const [generating, setGenerating] = useState(false);
-  const [currentDoc, setCurrentDoc] = useState<string | null>(null);
+  const [currentDoc, setCurrentDoc] = useState<{ id?: string, title: string, content: string, type: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [allDocs, setAllDocs] = useState<SavedDoc[]>([]);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'info' } | null>(null);
+
+  const showToast = (message: string, type: 'success' | 'info' = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 5000);
+  };
 
   // Auth Listener
   useEffect(() => {
@@ -242,7 +252,11 @@ export default function App() {
     try {
       const provider = new GoogleAuthProvider();
       await signInWithPopup(auth, provider);
-    } catch (err) {
+    } catch (err: any) {
+      if (err.code === 'auth/cancelled-popup-request' || err.code === 'auth/popup-closed-by-user') {
+        console.warn('Sign-in popup was cancelled or closed.');
+        return;
+      }
       console.error(err);
       setError("Failed to sign in. Please try again.");
     }
@@ -250,17 +264,62 @@ export default function App() {
 
   const handleLogout = () => signOut(auth);
 
-  const saveDocument = async (title: string, type: string, content: string) => {
+  const sendEmailNotification = async (to: string, subject: string, text: string) => {
+    try {
+      await addDoc(collection(db, 'mail'), {
+        to,
+        message: {
+          subject,
+          text,
+          html: `<p>${text.replace(/\n/g, '<br>')}</p>`
+        }
+      });
+    } catch (err) {
+      console.error("Failed to queue email notification:", err);
+    }
+  };
+
+  const saveDocument = async (title: string, type: string, content: string, existingId?: string) => {
     if (!user) return;
     try {
-      await addDoc(collection(db, 'documents'), {
-        ownerId: user.uid,
-        title,
-        type,
-        content,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      });
+      if (existingId) {
+        const docRef = doc(db, 'documents', existingId);
+        await setDoc(docRef, {
+          title,
+          content,
+          updatedAt: serverTimestamp()
+        }, { merge: true });
+
+        // Save version history
+        const versionRef = collection(db, 'documents', existingId, 'versions');
+        await addDoc(versionRef, {
+          content,
+          createdAt: serverTimestamp(),
+          createdBy: user.uid
+        });
+        showToast(`Document "${title}" updated and version saved.`);
+      } else {
+        const docRef = await addDoc(collection(db, 'documents'), {
+          ownerId: user.uid,
+          title,
+          type,
+          content,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+        
+        // Save initial version
+        const versionRef = collection(db, 'documents', docRef.id, 'versions');
+        await addDoc(versionRef, {
+          content,
+          createdAt: serverTimestamp(),
+          createdBy: user.uid
+        });
+        showToast(`Document "${title}" saved successfully.`);
+        if (userProfile?.email) {
+          sendEmailNotification(userProfile.email, `Document Generated: ${title}`, `Your document "${title}" of type ${type} has been successfully generated and saved to your dashboard.`);
+        }
+      }
       setActiveService('Dashboard');
     } catch (err) {
       console.error(err);
@@ -310,8 +369,32 @@ export default function App() {
     );
   }
 
+  const hasPermission = (service: string) => {
+    if (userProfile?.role === 'admin') return true;
+    if (!userProfile?.permissions) return true; // Default to all if not set
+    return userProfile.permissions.includes(service);
+  };
+
   return (
     <div className="min-h-screen bg-zinc-50 flex">
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 50 }}
+            className={cn(
+              "fixed bottom-6 right-6 px-6 py-3 rounded-xl shadow-lg border text-sm font-medium z-50 flex items-center gap-2",
+              toast.type === 'success' ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-blue-50 border-blue-200 text-blue-800"
+            )}
+          >
+            {toast.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
+            {toast.message}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
       <aside className="w-72 bg-white border-r border-zinc-200 flex flex-col fixed h-full">
         <div className="p-6 border-bottom border-zinc-100">
@@ -333,48 +416,60 @@ export default function App() {
           />
           
           <p className="px-4 py-2 mt-6 text-xs font-semibold text-zinc-400 uppercase tracking-wider">Services</p>
-          <SidebarItem 
-            icon={<FileText className="w-5 h-5" />} 
-            label="QHSE Generator" 
-            active={activeService === 'QHSE'} 
-            onClick={() => setActiveService('QHSE')} 
-          />
-          <SidebarItem 
-            icon={<CheckCircle2 className="w-5 h-5" />} 
-            label="HSE SOP Generator" 
-            active={activeService === 'SOP'} 
-            onClick={() => setActiveService('SOP')} 
-          />
-          <SidebarItem 
-            icon={<Plus className="w-5 h-5" />} 
-            label="Toolbox Talk" 
-            active={activeService === 'Toolbox'} 
-            onClick={() => setActiveService('Toolbox')} 
-          />
-          <SidebarItem 
-            icon={<BookOpen className="w-5 h-5" />} 
-            label="School Project" 
-            active={activeService === 'Project'} 
-            onClick={() => setActiveService('Project')} 
-          />
+          {hasPermission('QHSE') && (
+            <SidebarItem 
+              icon={<FileText className="w-5 h-5" />} 
+              label="QHSE Generator" 
+              active={activeService === 'QHSE'} 
+              onClick={() => setActiveService('QHSE')} 
+            />
+          )}
+          {hasPermission('SOP') && (
+            <SidebarItem 
+              icon={<CheckCircle2 className="w-5 h-5" />} 
+              label="HSE SOP Generator" 
+              active={activeService === 'SOP'} 
+              onClick={() => setActiveService('SOP')} 
+            />
+          )}
+          {hasPermission('Toolbox') && (
+            <SidebarItem 
+              icon={<Plus className="w-5 h-5" />} 
+              label="Toolbox Talk" 
+              active={activeService === 'Toolbox'} 
+              onClick={() => setActiveService('Toolbox')} 
+            />
+          )}
+          {hasPermission('Project') && (
+            <SidebarItem 
+              icon={<BookOpen className="w-5 h-5" />} 
+              label="School Project" 
+              active={activeService === 'Project'} 
+              onClick={() => setActiveService('Project')} 
+            />
+          )}
           <SidebarItem 
             icon={<Edit3 className="w-5 h-5" />} 
             label="Edit / Rewrite" 
             active={activeService === 'Edit'} 
             onClick={() => setActiveService('Edit')} 
           />
-          <SidebarItem 
-            icon={<FileUp className="w-5 h-5" />} 
-            label="PDF to Word" 
-            active={activeService === 'Conversion'} 
-            onClick={() => setActiveService('Conversion')} 
-          />
-          <SidebarItem 
-            icon={<ShieldCheck className="w-5 h-5" />} 
-            label="Permit to Work" 
-            active={activeService === 'Permit'} 
-            onClick={() => setActiveService('Permit')} 
-          />
+          {hasPermission('Conversion') && (
+            <SidebarItem 
+              icon={<FileUp className="w-5 h-5" />} 
+              label="PDF to Word" 
+              active={activeService === 'Conversion'} 
+              onClick={() => setActiveService('Conversion')} 
+            />
+          )}
+          {hasPermission('Permit') && (
+            <SidebarItem 
+              icon={<ShieldCheck className="w-5 h-5" />} 
+              label="Permit to Work" 
+              active={activeService === 'Permit'} 
+              onClick={() => setActiveService('Permit')} 
+            />
+          )}
 
           {userProfile?.role === 'admin' && (
             <>
@@ -430,7 +525,7 @@ export default function App() {
                   <div className="grid grid-cols-1 gap-4">
                     {documents.map(doc => (
                       <Card key={doc.id} className="p-4 hover:border-emerald-500 transition-all cursor-pointer group" onClick={() => {
-                        setCurrentDoc(doc.content);
+                        setCurrentDoc({ id: doc.id, title: doc.title, content: doc.content, type: doc.type });
                         setActiveService('Edit');
                       }}>
                         <div className="flex items-center justify-between">
@@ -467,7 +562,11 @@ export default function App() {
                   try {
                     const content = await generateQHSEDocument(params);
                     if (content) {
-                      await saveDocument(`${params.companyName} - ${params.type}`, params.type, content);
+                      setCurrentDoc({ title: `${params.companyName} - ${params.type}`, content, type: params.type });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Document Generated: ${params.type}`, `Your document "${params.companyName} - ${params.type}" has been successfully generated and is ready for editing.`);
+                      }
                     }
                   } catch (err) {
                     console.error(err);
@@ -487,7 +586,11 @@ export default function App() {
                   try {
                     const content = await generateQHSEDocument({ ...params, type: 'SOP' });
                     if (content) {
-                      await saveDocument(`${params.companyName} - SOP`, 'SOP', content);
+                      setCurrentDoc({ title: `${params.companyName} - SOP`, content, type: 'SOP' });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Document Generated: SOP`, `Your SOP for "${params.companyName}" has been successfully generated and is ready for editing.`);
+                      }
                     }
                   } catch (err) {
                     console.error(err);
@@ -515,7 +618,11 @@ export default function App() {
                       ppe: 'N/A'
                     });
                     if (content) {
-                      await saveDocument(`${params.topic} - Toolbox Talk`, 'Toolbox Talk', content);
+                      setCurrentDoc({ title: `${params.topic} - Toolbox Talk`, content, type: 'Toolbox Talk' });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Document Generated: Toolbox Talk`, `Your Toolbox Talk on "${params.topic}" has been successfully generated and is ready for editing.`);
+                      }
                     }
                   } catch (err) {
                     console.error(err);
@@ -535,7 +642,11 @@ export default function App() {
                   try {
                     const content = await generateSchoolProject(params);
                     if (content) {
-                      await saveDocument(params.topic, `Project (${params.level})`, content);
+                      setCurrentDoc({ title: `Project (${params.level})`, content, type: 'School Project' });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Project Generated`, `Your academic project on "${params.topic}" has been successfully generated and is ready for editing.`);
+                      }
                     }
                   } catch (err) {
                     console.error(err);
@@ -548,11 +659,11 @@ export default function App() {
               />
             )}
 
-            {activeService === 'Edit' && (
+            {activeService === 'Edit' && currentDoc && (
               <Editor 
-                initialContent={currentDoc || ''} 
+                docData={currentDoc} 
                 onSave={async (title, content) => {
-                  await saveDocument(title, 'Edited Doc', content);
+                  await saveDocument(title, currentDoc.type, content, currentDoc.id);
                 }}
                 onRewrite={async (content, instruction) => {
                   setGenerating(true);
@@ -569,8 +680,11 @@ export default function App() {
             {activeService === 'Conversion' && (
               <PDFWorkspace 
                 onExtracted={async (content) => {
-                  setCurrentDoc(content);
+                  setCurrentDoc({ title: 'Extracted PDF', content, type: 'Converted PDF' });
                   setActiveService('Edit');
+                  if (userProfile?.email) {
+                    sendEmailNotification(userProfile.email, `PDF Conversion Complete`, `Your PDF has been successfully converted to editable text.`);
+                  }
                 }}
                 loading={generating}
                 setLoading={setGenerating}
@@ -584,7 +698,11 @@ export default function App() {
                   try {
                     const content = await generatePermitToWork(params);
                     if (content) {
-                      await saveDocument(`${params.companyName} - Permit to Work`, 'Permit to Work', content);
+                      setCurrentDoc({ title: `${params.companyName} - Permit to Work`, content, type: 'Permit to Work' });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Document Generated: Permit to Work`, `Your Permit to Work for "${params.companyName}" has been successfully generated and is ready for editing.`);
+                      }
                     }
                   } catch (err) {
                     console.error(err);
@@ -601,12 +719,18 @@ export default function App() {
               <AdminDashboard 
                 users={allUsers} 
                 docs={allDocs} 
-                onUpdateRole={async (uid, role) => {
+                onUpdateUser={async (uid: string, updates: any) => {
                   try {
-                    await setDoc(doc(db, 'users', uid), { role }, { merge: true });
+                    await setDoc(doc(db, 'users', uid), updates, { merge: true });
+                    showToast(`User updated successfully.`, 'success');
+                    const updatedUser = allUsers.find(u => u.uid === uid);
+                    if (updatedUser?.email) {
+                      const changes = Object.keys(updates).map(k => `${k} changed to ${JSON.stringify(updates[k])}`).join(', ');
+                      sendEmailNotification(updatedUser.email, `Account Updated`, `Your account has been updated by an administrator. Changes: ${changes}`);
+                    }
                   } catch (err) {
                     console.error(err);
-                    setError("Failed to update role.");
+                    showToast("Failed to update user.", 'info');
                   }
                 }}
               />
@@ -674,7 +798,8 @@ const QHSEGenerator = ({ onGenerate, loading }: any) => {
     numWorkers: '',
     ppe: '',
     date: new Date().toISOString().split('T')[0],
-    supervisorName: ''
+    supervisorName: '',
+    formatStyle: 'Corporate Standard'
   });
 
   return (
@@ -704,6 +829,20 @@ const QHSEGenerator = ({ onGenerate, loading }: any) => {
           <Input label="Supervisor Name" value={params.supervisorName} onChange={(v: string) => setParams({ ...params, supervisorName: v })} placeholder="e.g. Engr. Michael" />
           <Input label="Number of Workers" value={params.numWorkers} onChange={(v: string) => setParams({ ...params, numWorkers: v })} placeholder="e.g. 25" />
           <Input label="Date" type="date" value={params.date} onChange={(v: string) => setParams({ ...params, date: v })} />
+          
+          <div className="space-y-1.5 md:col-span-2">
+            <label className="text-sm font-medium text-zinc-700">Format Style</label>
+            <select 
+              value={params.formatStyle} 
+              onChange={(e) => setParams({ ...params, formatStyle: e.target.value })}
+              className="w-full px-3 py-2 bg-white border border-zinc-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-zinc-900"
+            >
+              <option value="Corporate Standard">Corporate Standard</option>
+              <option value="ISO 45001 Compliant">ISO 45001 Compliant</option>
+              <option value="Minimalist / Field-Ready">Minimalist / Field-Ready</option>
+            </select>
+          </div>
+
           <div className="md:col-span-2">
             <TextArea label="Task / Activity" value={params.taskActivity} onChange={(v: string) => setParams({ ...params, taskActivity: v })} placeholder="Describe the work being done..." />
           </div>
@@ -798,7 +937,7 @@ const ToolboxTalkGenerator = ({ onGenerate, loading }: any) => {
 };
 
 const ProjectWriter = ({ onGenerate, loading }: any) => {
-  const [params, setParams] = useState({ topic: '', level: 'BSc' });
+  const [params, setParams] = useState({ topic: '', level: 'BSc', formatStyle: 'APA' });
 
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
@@ -806,25 +945,43 @@ const ProjectWriter = ({ onGenerate, loading }: any) => {
       <Card className="p-8">
         <div className="space-y-6">
           <Input label="Project Topic" value={params.topic} onChange={(v: string) => setParams({ ...params, topic: v })} placeholder="e.g. Impact of HSE Management on Construction Productivity" />
-          <div className="space-y-2">
-            <label className="text-sm font-medium text-zinc-700">Academic Level</label>
-            <div className="flex gap-4">
-              {['ND', 'HND', 'BSc', 'MSc'].map(l => (
-                <button 
-                  key={l}
-                  onClick={() => setParams({ ...params, level: l })}
-                  className={cn(
-                    "flex-1 py-3 rounded-xl border-2 transition-all font-bold",
-                    params.level === l 
-                      ? "border-emerald-600 bg-emerald-50 text-emerald-700" 
-                      : "border-zinc-100 bg-zinc-50 text-zinc-400 hover:border-zinc-200"
-                  )}
-                >
-                  {l}
-                </button>
-              ))}
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-zinc-700">Academic Level</label>
+              <div className="flex gap-4">
+                {['ND', 'HND', 'BSc', 'MSc'].map(l => (
+                  <button 
+                    key={l}
+                    onClick={() => setParams({ ...params, level: l })}
+                    className={cn(
+                      "flex-1 py-3 rounded-xl border-2 transition-all font-bold",
+                      params.level === l 
+                        ? "border-emerald-600 bg-emerald-50 text-emerald-700" 
+                        : "border-zinc-100 bg-zinc-50 text-zinc-400 hover:border-zinc-200"
+                    )}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium text-zinc-700">Format Style</label>
+              <select 
+                value={params.formatStyle} 
+                onChange={(e) => setParams({ ...params, formatStyle: e.target.value })}
+                className="w-full px-3 py-3 bg-white border border-zinc-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-zinc-900"
+              >
+                <option value="APA">APA (American Psychological Association)</option>
+                <option value="MLA">MLA (Modern Language Association)</option>
+                <option value="Harvard">Harvard Referencing</option>
+                <option value="Chicago">Chicago Manual of Style</option>
+              </select>
             </div>
           </div>
+
           <div className="p-4 bg-blue-50 rounded-xl flex gap-3">
             <AlertCircle className="w-5 h-5 text-blue-600 shrink-0" />
             <p className="text-sm text-blue-700">Our AI generates human-written, natural academic content that avoids robotic phrasing and is plagiarism-free.</p>
@@ -878,8 +1035,18 @@ const PermitGenerator = ({ onGenerate, loading }: any) => {
   );
 };
 
-const AdminDashboard = ({ users, docs, onUpdateRole }: any) => {
+const AdminDashboard = ({ users, docs, onUpdateUser }: any) => {
   const [view, setView] = useState<'users' | 'docs'>('users');
+
+  const availablePermissions = ['QHSE', 'SOP', 'Project', 'Toolbox', 'Permit', 'Conversion'];
+
+  const togglePermission = (user: UserProfile, perm: string) => {
+    const current = user.permissions || [];
+    const updated = current.includes(perm) 
+      ? current.filter(p => p !== perm)
+      : [...current, perm];
+    onUpdateUser(user.uid, { permissions: updated });
+  };
 
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
@@ -899,6 +1066,7 @@ const AdminDashboard = ({ users, docs, onUpdateRole }: any) => {
                 <th className="p-4 font-semibold text-zinc-600">User</th>
                 <th className="p-4 font-semibold text-zinc-600">Email</th>
                 <th className="p-4 font-semibold text-zinc-600">Role</th>
+                <th className="p-4 font-semibold text-zinc-600">Permissions</th>
                 <th className="p-4 font-semibold text-zinc-600">Actions</th>
               </tr>
             </thead>
@@ -916,9 +1084,29 @@ const AdminDashboard = ({ users, docs, onUpdateRole }: any) => {
                     </span>
                   </td>
                   <td className="p-4">
+                    <div className="flex flex-wrap gap-1">
+                      {availablePermissions.map(perm => (
+                        <button
+                          key={perm}
+                          onClick={() => togglePermission(u, perm)}
+                          className={cn(
+                            "px-2 py-1 rounded text-xs border transition-colors",
+                            (u.permissions || []).includes(perm) || u.role === 'admin'
+                              ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                              : "bg-zinc-50 border-zinc-200 text-zinc-400 hover:border-zinc-300"
+                          )}
+                          disabled={u.role === 'admin'}
+                          title={u.role === 'admin' ? "Admins have all permissions" : `Toggle ${perm}`}
+                        >
+                          {perm}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="p-4">
                     <select 
                       value={u.role} 
-                      onChange={(e) => onUpdateRole(u.uid, e.target.value)}
+                      onChange={(e) => onUpdateUser(u.uid, { role: e.target.value })}
                       className="text-sm border border-zinc-200 rounded px-2 py-1"
                     >
                       <option value="user">User</option>
@@ -1008,18 +1196,38 @@ const PDFWorkspace = ({ onExtracted, loading, setLoading }: any) => {
   );
 };
 
-const Editor = ({ initialContent, onSave, onRewrite, loading }: any) => {
-  const [content, setContent] = useState(initialContent);
-  const [title, setTitle] = useState('New Document');
+const Editor = ({ docData, onSave, onRewrite, loading }: any) => {
+  const [content, setContent] = useState(docData?.content || '');
+  const [title, setTitle] = useState(docData?.title || 'New Document');
   const [instruction, setInstruction] = useState('');
   const [view, setView] = useState<'edit' | 'preview'>('edit');
+  const [showVersions, setShowVersions] = useState(false);
+  const [versions, setVersions] = useState<any[]>([]);
+  const [loadingVersions, setLoadingVersions] = useState(false);
 
   useEffect(() => {
-    setContent(initialContent);
-  }, [initialContent]);
+    setContent(docData?.content || '');
+    setTitle(docData?.title || 'New Document');
+  }, [docData]);
+
+  const loadVersions = async () => {
+    if (!docData?.id) return;
+    setLoadingVersions(true);
+    setShowVersions(true);
+    try {
+      const q = query(collection(db, 'documents', docData.id, 'versions'), orderBy('createdAt', 'desc'));
+      const snapshot = await getDocs(q);
+      const v = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setVersions(v);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingVersions(false);
+    }
+  };
 
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6 relative">
       <div className="flex justify-between items-center">
         <div className="flex-1 mr-4">
           <input 
@@ -1029,6 +1237,11 @@ const Editor = ({ initialContent, onSave, onRewrite, loading }: any) => {
           />
         </div>
         <div className="flex gap-2">
+          {docData?.id && (
+            <Button variant="outline" onClick={loadVersions}>
+              <History className="w-4 h-4 mr-2" /> Versions
+            </Button>
+          )}
           <Button variant="outline" onClick={() => setView(view === 'edit' ? 'preview' : 'edit')}>
             {view === 'edit' ? 'Preview' : 'Edit'}
           </Button>
@@ -1038,7 +1251,39 @@ const Editor = ({ initialContent, onSave, onRewrite, loading }: any) => {
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
         <div className="lg:col-span-3">
-          <Card className="min-h-[600px] flex flex-col">
+          <Card className="min-h-[600px] flex flex-col relative overflow-hidden">
+            {showVersions ? (
+              <div className="absolute inset-0 bg-white z-10 p-6 overflow-y-auto flex flex-col">
+                <div className="flex justify-between items-center mb-6">
+                  <h3 className="text-xl font-bold">Version History</h3>
+                  <Button variant="ghost" onClick={() => setShowVersions(false)}><X className="w-5 h-5" /></Button>
+                </div>
+                {loadingVersions ? (
+                  <div className="flex-1 flex items-center justify-center"><Loader2 className="w-8 h-8 animate-spin text-emerald-600" /></div>
+                ) : (
+                  <div className="space-y-4">
+                    {versions.map((v, i) => (
+                      <Card key={v.id} className="p-4 flex justify-between items-center bg-zinc-50">
+                        <div>
+                          <p className="font-semibold text-zinc-900">Version {versions.length - i}</p>
+                          <p className="text-sm text-zinc-500">
+                            {v.createdAt?.toDate ? v.createdAt.toDate().toLocaleString() : 'Just now'}
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          <Button variant="outline" onClick={() => {
+                            setContent(v.content);
+                            setShowVersions(false);
+                          }}>Restore</Button>
+                        </div>
+                      </Card>
+                    ))}
+                    {versions.length === 0 && <p className="text-zinc-500">No versions found.</p>}
+                  </div>
+                )}
+              </div>
+            ) : null}
+
             {view === 'edit' ? (
               <textarea
                 value={content}

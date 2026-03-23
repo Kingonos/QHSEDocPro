@@ -13,6 +13,7 @@ export interface QHSEParams {
   ppe: string;
   date: string;
   supervisorName: string;
+  formatStyle?: string;
 }
 
 export async function generateQHSEDocument(params: QHSEParams) {
@@ -28,6 +29,7 @@ export async function generateQHSEDocument(params: QHSEParams) {
     PPE: ${params.ppe}
     Date: ${params.date}
     Supervisor: ${params.supervisorName}
+    Format Style: ${params.formatStyle || 'Corporate Standard'}
 
     The document must include:
     - Title Page
@@ -41,6 +43,7 @@ export async function generateQHSEDocument(params: QHSEParams) {
     - References
     - Approval Page
 
+    Ensure the formatting strictly follows the requested Format Style (${params.formatStyle || 'Corporate Standard'}).
     Writing style: Professional, human-like, clear, and natural. Avoid robotic or AI-sounding phrases.
     Format: Markdown.
   `;
@@ -56,6 +59,7 @@ export async function generateQHSEDocument(params: QHSEParams) {
 export interface ProjectParams {
   topic: string;
   level: string;
+  formatStyle?: string;
 }
 
 export async function generateSchoolProject(params: ProjectParams) {
@@ -64,6 +68,7 @@ export async function generateSchoolProject(params: ProjectParams) {
     Generate a natural, human-written academic project for:
     Topic: ${params.topic}
     Level: ${params.level}
+    Format Style: ${params.formatStyle || 'APA'}
 
     The project must include:
     - Abstract
@@ -73,8 +78,9 @@ export async function generateSchoolProject(params: ProjectParams) {
     - Chapter Three: Methodology
     - Chapter Four: Results and Discussion
     - Chapter Five: Conclusion and Recommendation
-    - References
+    - References (in ${params.formatStyle || 'APA'} format)
 
+    Ensure the citations and overall structure strictly follow the requested Format Style (${params.formatStyle || 'APA'}).
     Writing style: Human-written, simple English, natural flow, no robotic or AI phrases. Include real-life examples where relevant. Well-structured and plagiarism-free.
     Format: Markdown.
   `;
@@ -124,9 +130,16 @@ export async function generatePermitToWork(params: any) {
 
 export async function extractTextFromPDF(content: string) {
   const prompt = `
-    You are a professional Document Specialist.
+    You are a professional Document Specialist and Data Extraction Expert.
     Extract the text from the following OCR/PDF content and format it into a clean, professional Markdown document.
-    Maintain complex tables, multi-column layouts, and headings as accurately as possible.
+    
+    CRITICAL INSTRUCTIONS FOR TABLES:
+    - You MUST preserve all table structures, including nested tables and merged cells.
+    - If you encounter tabular data, format it strictly as Markdown tables.
+    - Ensure columns align correctly and cell data is not mixed up.
+    - If a table has merged cells, represent the data logically within the Markdown table constraints (e.g., repeating the merged value or combining headers).
+    - For nested tables, use HTML tables inside Markdown if necessary, or flatten them logically.
+    - Maintain the hierarchy of headings (H1, H2, H3) to reflect the document structure.
     
     Raw Content:
     ${content}
@@ -135,7 +148,7 @@ export async function extractTextFromPDF(content: string) {
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: "gemini-3.1-pro-preview",
     contents: prompt,
   });
 

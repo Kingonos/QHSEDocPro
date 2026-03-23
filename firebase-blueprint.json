@@ -10,9 +10,22 @@
         "displayName": { "type": "string", "description": "User's display name." },
         "photoURL": { "type": "string", "format": "uri", "description": "User's profile picture URL." },
         "role": { "type": "string", "enum": ["user", "admin"], "description": "User's role in the system." },
+        "permissions": { "type": "array", "items": { "type": "string" }, "description": "Granular permissions for the user." },
         "createdAt": { "type": "string", "format": "date-time", "description": "When the profile was created." }
       },
       "required": ["uid", "email", "role"]
+    },
+    "DocumentVersion": {
+      "title": "Document Version",
+      "description": "A historical version of a document.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique version ID." },
+        "content": { "type": "string", "description": "The content of the document at this version." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When this version was saved." },
+        "createdBy": { "type": "string", "description": "UID of the user who saved this version." }
+      },
+      "required": ["content", "createdAt", "createdBy"]
     },
     "Document": {
       "title": "Generated Document",
@@ -43,9 +56,30 @@
         "createdAt": { "type": "string", "format": "date-time", "description": "When the project was generated." }
       },
       "required": ["ownerId", "topic", "level", "chapters"]
+    },
+    "Mail": {
+      "title": "Email Notification",
+      "description": "An email to be sent via Firebase Trigger Email extension.",
+      "type": "object",
+      "properties": {
+        "to": { "type": "string", "description": "Recipient email address." },
+        "message": {
+          "type": "object",
+          "properties": {
+            "subject": { "type": "string", "description": "Email subject." },
+            "text": { "type": "string", "description": "Plain text email body." },
+            "html": { "type": "string", "description": "HTML email body." }
+          }
+        }
+      },
+      "required": ["to", "message"]
     }
   },
   "firestore": {
+    "/mail/{messageId}": {
+      "schema": "Mail",
+      "description": "Emails to be processed by the Trigger Email extension."
+    },
     "/users/{uid}": {
       "schema": "UserProfile",
       "description": "Individual user profiles."
@@ -53,6 +87,10 @@
     "/documents/{docId}": {
       "schema": "Document",
       "description": "A collection of generated QHSE documents."
+    },
+    "/documents/{docId}/versions/{versionId}": {
+      "schema": "DocumentVersion",
+      "description": "A collection of historical versions for a specific document."
     },
     "/projects/{projectId}": {
       "schema": "Project",

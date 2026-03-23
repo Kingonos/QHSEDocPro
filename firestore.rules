@@ -13,6 +13,7 @@ service cloud.firestore {
     //   - displayName: string (optional)
     //   - photoURL: string (optional)
     //   - role: string (required, enum: ['user', 'admin'])
+    //   - permissions: list (optional)
     //   - createdAt: timestamp (required)
     //
     // Collection: documents
@@ -25,6 +26,13 @@ service cloud.firestore {
     //   - metadata: map (optional)
     //   - createdAt: timestamp (required)
     //   - updatedAt: timestamp (required)
+    //
+    // Collection: documents/{docId}/versions
+    // Document ID: {versionId}
+    // Fields:
+    //   - content: string (required)
+    //   - createdAt: timestamp (required)
+    //   - createdBy: string (required)
     //
     // Collection: projects
     // Document ID: {projectId}
@@ -63,6 +71,7 @@ service cloud.firestore {
              data.uid is string &&
              data.email is string &&
              data.role in ['user', 'admin'] &&
+             (!('permissions' in data) || data.permissions is list) &&
              data.createdAt is timestamp;
     }
 
@@ -85,9 +94,31 @@ service cloud.firestore {
              data.createdAt is timestamp;
     }
 
+    function isValidDocumentVersion(data) {
+      return data.keys().hasAll(['content', 'createdAt', 'createdBy']) &&
+             data.content is string && data.content.size() < 1000000 &&
+             data.createdAt is timestamp &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidMail(data) {
+      return data.keys().hasAll(['to', 'message']) &&
+             data.to is string && data.to.size() < 200 &&
+             data.message is map &&
+             data.message.keys().hasAll(['subject', 'text', 'html']) &&
+             data.message.subject is string && data.message.subject.size() < 200 &&
+             data.message.text is string && data.message.text.size() < 1000000 &&
+             data.message.html is string && data.message.html.size() < 1000000;
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
+
+    match /mail/{messageId} {
+      allow create: if isAuthenticated() && isValidMail(request.resource.data);
+      allow read, update, delete: if false; // Only extension should read/update
+    }
 
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
@@ -100,6 +131,11 @@ service cloud.firestore {
       allow create: if isAuthenticated() && isValidDocument(request.resource.data);
       allow update: if isDocOwner() && isValidDocument(request.resource.data);
       allow delete: if isDocOwner() || isAdmin();
+
+      match /versions/{versionId} {
+        allow read: if isDocOwner() || isAdmin();
+        allow create: if isDocOwner() && isValidDocumentVersion(request.resource.data);
+      }
     }
 
     match /projects/{projectId} {
