@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Component, ErrorInfo, ReactNode } from 'react';
 import { 
   onAuthStateChanged, 
   signInWithPopup, 
@@ -26,6 +26,58 @@ import {
   getDocs
 } from 'firebase/firestore';
 import { auth, db } from './firebase';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 import { 
   FileText, 
   BookOpen, 
@@ -40,15 +92,21 @@ import {
   ShieldCheck,
   CheckCircle2,
   AlertCircle,
-  X
+  X,
+  Copy,
+  Download,
+  Presentation
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import Markdown from 'react-markdown';
-import { generateQHSEDocument, generateSchoolProject, rewriteDocument, generatePermitToWork, extractTextFromPDF } from './services/geminiService';
+import { marked } from 'marked';
+import { generateQHSEDocument, generateSchoolProject, rewriteDocument, generatePermitToWork, extractTextFromPDF, generatePresentation } from './services/geminiService';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import * as mammoth from 'mammoth';
+import JSZip from 'jszip';
 
 // Set up PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
@@ -58,8 +116,27 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+const downloadAsWord = async (content: string, title: string) => {
+  const htmlContent = await marked.parse(content);
+  const header = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>${title}</title></head><body>`;
+  const footer = "</body></html>";
+  const sourceHTML = header + htmlContent + footer;
+  
+  const blob = new Blob(['\ufeff', sourceHTML], {
+    type: 'application/msword'
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${title || 'document'}.doc`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+};
+
 // --- Types ---
-type Service = 'QHSE' | 'SOP' | 'Project' | 'Conversion' | 'Edit' | 'Dashboard' | 'Toolbox' | 'Permit' | 'Admin';
+type Service = 'QHSE' | 'SOP' | 'Project' | 'Conversion' | 'Edit' | 'Dashboard' | 'Toolbox' | 'Permit' | 'Presentation' | 'Admin';
 
 interface SavedDoc {
   id: string;
@@ -90,7 +167,7 @@ const Button = ({
   loading
 }: { 
   children: React.ReactNode; 
-  onClick?: () => void; 
+  onClick?: (e?: any) => void; 
   variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
   className?: string;
   disabled?: boolean;
@@ -156,9 +233,65 @@ const TextArea = ({ label, value, onChange, placeholder, rows = 4 }: any) => (
   </div>
 );
 
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean, error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "An unexpected error occurred.";
+      try {
+        if (this.state.error?.message) {
+          const parsed = JSON.parse(this.state.error.message);
+          if (parsed.error) {
+            errorMessage = parsed.error;
+          }
+        }
+      } catch (e) {
+        errorMessage = this.state.error?.message || errorMessage;
+      }
+
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
+          <Card className="max-w-md w-full p-8 text-center space-y-4">
+            <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4">
+              <AlertCircle className="w-8 h-8" />
+            </div>
+            <h2 className="text-2xl font-bold text-zinc-900">Something went wrong</h2>
+            <p className="text-zinc-600">{errorMessage}</p>
+            <Button className="mt-6" onClick={() => window.location.reload()}>
+              Reload Application
+            </Button>
+          </Card>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 // --- Main App Component ---
 
-export default function App() {
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+function AppContent() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeService, setActiveService] = useState<Service>('Dashboard');
@@ -183,7 +316,14 @@ export default function App() {
       if (u) {
         // Ensure user profile exists in Firestore
         const userRef = doc(db, 'users', u.uid);
-        const userSnap = await getDoc(userRef);
+        let userSnap;
+        try {
+          userSnap = await getDoc(userRef);
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `users/${u.uid}`);
+          throw error;
+        }
+        
         if (!userSnap.exists()) {
           const newProfile: UserProfile = {
             uid: u.uid,
@@ -192,7 +332,11 @@ export default function App() {
             role: 'user',
             createdAt: serverTimestamp()
           };
-          await setDoc(userRef, newProfile);
+          try {
+            await setDoc(userRef, newProfile);
+          } catch (error) {
+            handleFirestoreError(error, OperationType.WRITE, `users/${u.uid}`);
+          }
           setUserProfile(newProfile);
         } else {
           setUserProfile(userSnap.data() as UserProfile);
@@ -211,10 +355,14 @@ export default function App() {
 
     const usersUnsub = onSnapshot(collection(db, 'users'), (snap) => {
       setAllUsers(snap.docs.map(d => d.data() as UserProfile));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'users');
     });
 
     const docsUnsub = onSnapshot(collection(db, 'documents'), (snap) => {
       setAllDocs(snap.docs.map(d => ({ id: d.id, ...d.data() } as SavedDoc)));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'documents');
     });
 
     return () => {
@@ -230,6 +378,8 @@ export default function App() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as SavedDoc));
       setDocuments(docs.sort((a, b) => b.createdAt?.seconds - a.createdAt?.seconds));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'documents');
     });
     return unsubscribe;
   }, [user]);
@@ -275,6 +425,7 @@ export default function App() {
         }
       });
     } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'mail');
       console.error("Failed to queue email notification:", err);
     }
   };
@@ -284,37 +435,55 @@ export default function App() {
     try {
       if (existingId) {
         const docRef = doc(db, 'documents', existingId);
-        await setDoc(docRef, {
-          title,
-          content,
-          updatedAt: serverTimestamp()
-        }, { merge: true });
+        try {
+          await setDoc(docRef, {
+            title,
+            content,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.UPDATE, `documents/${existingId}`);
+        }
 
         // Save version history
         const versionRef = collection(db, 'documents', existingId, 'versions');
-        await addDoc(versionRef, {
-          content,
-          createdAt: serverTimestamp(),
-          createdBy: user.uid
-        });
+        try {
+          await addDoc(versionRef, {
+            content,
+            createdAt: serverTimestamp(),
+            createdBy: user.uid
+          });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.CREATE, `documents/${existingId}/versions`);
+        }
         showToast(`Document "${title}" updated and version saved.`);
       } else {
-        const docRef = await addDoc(collection(db, 'documents'), {
-          ownerId: user.uid,
-          title,
-          type,
-          content,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
-        });
+        let docRef;
+        try {
+          docRef = await addDoc(collection(db, 'documents'), {
+            ownerId: user.uid,
+            title,
+            type,
+            content,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.CREATE, 'documents');
+          throw error;
+        }
         
         // Save initial version
         const versionRef = collection(db, 'documents', docRef.id, 'versions');
-        await addDoc(versionRef, {
-          content,
-          createdAt: serverTimestamp(),
-          createdBy: user.uid
-        });
+        try {
+          await addDoc(versionRef, {
+            content,
+            createdAt: serverTimestamp(),
+            createdBy: user.uid
+          });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.CREATE, `documents/${docRef.id}/versions`);
+        }
         showToast(`Document "${title}" saved successfully.`);
         if (userProfile?.email) {
           sendEmailNotification(userProfile.email, `Document Generated: ${title}`, `Your document "${title}" of type ${type} has been successfully generated and saved to your dashboard.`);
@@ -470,6 +639,14 @@ export default function App() {
               onClick={() => setActiveService('Permit')} 
             />
           )}
+          {hasPermission('Presentation') && (
+            <SidebarItem 
+              icon={<Presentation className="w-5 h-5" />} 
+              label="Presentation Slides" 
+              active={activeService === 'Presentation'} 
+              onClick={() => setActiveService('Presentation')} 
+            />
+          )}
 
           {userProfile?.role === 'admin' && (
             <>
@@ -524,12 +701,12 @@ export default function App() {
                 {documents.length > 0 ? (
                   <div className="grid grid-cols-1 gap-4">
                     {documents.map(doc => (
-                      <Card key={doc.id} className="p-4 hover:border-emerald-500 transition-all cursor-pointer group" onClick={() => {
-                        setCurrentDoc({ id: doc.id, title: doc.title, content: doc.content, type: doc.type });
-                        setActiveService('Edit');
-                      }}>
+                      <Card key={doc.id} className="p-4 hover:border-emerald-500 transition-all group">
                         <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-4">
+                          <div className="flex items-center gap-4 cursor-pointer flex-1" onClick={() => {
+                            setCurrentDoc({ id: doc.id, title: doc.title, content: doc.content, type: doc.type });
+                            setActiveService('Edit');
+                          }}>
                             <div className="w-12 h-12 bg-zinc-50 rounded-lg flex items-center justify-center group-hover:bg-emerald-50 transition-colors">
                               <FileText className="w-6 h-6 text-zinc-400 group-hover:text-emerald-600" />
                             </div>
@@ -538,7 +715,15 @@ export default function App() {
                               <p className="text-sm text-zinc-500">{doc.type} • {new Date(doc.createdAt?.seconds * 1000).toLocaleDateString()}</p>
                             </div>
                           </div>
-                          <ChevronRight className="w-5 h-5 text-zinc-300 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all" />
+                          <div className="flex items-center gap-2">
+                            <Button variant="ghost" onClick={(e) => { e.stopPropagation(); downloadAsWord(doc.content, doc.title); }} className="text-zinc-500 hover:text-emerald-600">
+                              <Download className="w-4 h-4" />
+                            </Button>
+                            <ChevronRight className="w-5 h-5 text-zinc-300 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all cursor-pointer" onClick={() => {
+                              setCurrentDoc({ id: doc.id, title: doc.title, content: doc.content, type: doc.type });
+                              setActiveService('Edit');
+                            }} />
+                          </div>
                         </div>
                       </Card>
                     ))}
@@ -715,6 +900,30 @@ export default function App() {
               />
             )}
 
+            {activeService === 'Presentation' && (
+              <PresentationGenerator 
+                onGenerate={async (params: any) => {
+                  setGenerating(true);
+                  try {
+                    const content = await generatePresentation(params);
+                    if (content) {
+                      setCurrentDoc({ title: `${params.topic} - Presentation`, content, type: 'Presentation' });
+                      setActiveService('Edit');
+                      if (userProfile?.email) {
+                        sendEmailNotification(userProfile.email, `Document Generated: Presentation`, `Your presentation on "${params.topic}" has been successfully generated and is ready for editing.`);
+                      }
+                    }
+                  } catch (err) {
+                    console.error(err);
+                    setError("Generation failed.");
+                  } finally {
+                    setGenerating(false);
+                  }
+                }} 
+                loading={generating}
+              />
+            )}
+
             {activeService === 'Admin' && userProfile?.role === 'admin' && (
               <AdminDashboard 
                 users={allUsers} 
@@ -729,6 +938,7 @@ export default function App() {
                       sendEmailNotification(updatedUser.email, `Account Updated`, `Your account has been updated by an administrator. Changes: ${changes}`);
                     }
                   } catch (err) {
+                    handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
                     console.error(err);
                     showToast("Failed to update user.", 'info');
                   }
@@ -787,6 +997,81 @@ const StatCard = ({ label, value, icon }: { label: string; value: string | numbe
   </Card>
 );
 
+const DocumentUploader = ({ onUpload, id = "doc-upload" }: { onUpload: (text: string) => void, id?: string }) => {
+  const [loading, setLoading] = useState(false);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    try {
+      if (file.type === 'application/pdf') {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = "";
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map((item: any) => item.str).join(" ");
+          fullText += `--- Page ${i} ---\n${pageText}\n\n`;
+        }
+
+        const markdown = await extractTextFromPDF(fullText);
+        onUpload(markdown);
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx')) {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        onUpload(result.value);
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || file.name.endsWith('.pptx')) {
+        const arrayBuffer = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        let fullText = "";
+        
+        const slideFiles = Object.keys(zip.files).filter(name => name.match(/^ppt\/slides\/slide\d+\.xml$/));
+        
+        slideFiles.sort((a, b) => {
+          const numA = parseInt(a.match(/\d+/)?.[0] || "0");
+          const numB = parseInt(b.match(/\d+/)?.[0] || "0");
+          return numA - numB;
+        });
+
+        for (const slideFile of slideFiles) {
+          const content = await zip.files[slideFile].async("text");
+          const matches = content.match(/<a:t[^>]*>(.*?)<\/a:t>/g);
+          if (matches) {
+            const slideText = matches.map(m => m.replace(/<[^>]+>/g, '')).join(' ');
+            fullText += `--- ${slideFile} ---\n${slideText}\n\n`;
+          }
+        }
+        
+        onUpload(fullText);
+      } else if (file.type === 'text/plain') {
+        const text = await file.text();
+        onUpload(text);
+      } else {
+        alert("Unsupported file format. Please upload a PDF, DOCX, PPTX, or TXT file.");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Failed to process document.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="w-full">
+      <input type="file" className="hidden" id={id} accept=".pdf,.txt,.docx,.pptx" onChange={handleFileUpload} />
+      <Button variant="secondary" className="w-full flex items-center justify-center gap-2" loading={loading} onClick={() => document.getElementById(id)?.click()}>
+        <FileUp className="w-4 h-4" />
+        Upload Existing Document (PDF/DOCX/PPTX/TXT)
+      </Button>
+    </div>
+  );
+};
+
 const QHSEGenerator = ({ onGenerate, loading }: any) => {
   const [params, setParams] = useState({
     type: 'Risk Assessment',
@@ -799,15 +1084,24 @@ const QHSEGenerator = ({ onGenerate, loading }: any) => {
     ppe: '',
     date: new Date().toISOString().split('T')[0],
     supervisorName: '',
-    formatStyle: 'Corporate Standard'
+    formatStyle: 'Corporate Standard',
+    existingDocument: '',
+    updateInstructions: '',
+    time: '',
+    description: '',
+    involvedParties: '',
+    immediateActions: '',
+    witnesses: '',
+    existingControls: '',
+    proposedControls: ''
   });
 
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
       <div className="flex justify-between items-center">
         <h2 className="text-3xl font-bold text-zinc-900">QHSE Document Generator</h2>
-        <div className="flex gap-2">
-          {['Risk Assessment', 'HSE Plan', 'HSE Policy', 'JHA', 'SWMS'].map(t => (
+        <div className="flex gap-2 flex-wrap">
+          {['Risk Assessment', 'HSE Plan', 'HSE Policy', 'Job Hazard Analysis (JHA)', 'SWMS', 'Incident Report'].map(t => (
             <button 
               key={t}
               onClick={() => setParams({ ...params, type: t })}
@@ -826,9 +1120,20 @@ const QHSEGenerator = ({ onGenerate, loading }: any) => {
           <Input label="Company Name" value={params.companyName} onChange={(v: string) => setParams({ ...params, companyName: v })} placeholder="e.g. Global Construction Ltd" />
           <Input label="Project Name" value={params.projectName} onChange={(v: string) => setParams({ ...params, projectName: v })} placeholder="e.g. Bridge Expansion Phase 1" />
           <Input label="Location" value={params.location} onChange={(v: string) => setParams({ ...params, location: v })} placeholder="e.g. Lagos, Nigeria" />
-          <Input label="Supervisor Name" value={params.supervisorName} onChange={(v: string) => setParams({ ...params, supervisorName: v })} placeholder="e.g. Engr. Michael" />
-          <Input label="Number of Workers" value={params.numWorkers} onChange={(v: string) => setParams({ ...params, numWorkers: v })} placeholder="e.g. 25" />
+          
+          {params.type !== 'Incident Report' && (
+            <Input label="Supervisor Name" value={params.supervisorName} onChange={(v: string) => setParams({ ...params, supervisorName: v })} placeholder="e.g. Engr. Michael" />
+          )}
+          
+          {params.type !== 'Incident Report' && params.type !== 'Job Hazard Analysis (JHA)' && (
+            <Input label="Number of Workers" value={params.numWorkers} onChange={(v: string) => setParams({ ...params, numWorkers: v })} placeholder="e.g. 25" />
+          )}
+          
           <Input label="Date" type="date" value={params.date} onChange={(v: string) => setParams({ ...params, date: v })} />
+          
+          {params.type === 'Incident Report' && (
+            <Input label="Time of Incident" type="time" value={params.time} onChange={(v: string) => setParams({ ...params, time: v })} />
+          )}
           
           <div className="space-y-1.5 md:col-span-2">
             <label className="text-sm font-medium text-zinc-700">Format Style</label>
@@ -843,19 +1148,73 @@ const QHSEGenerator = ({ onGenerate, loading }: any) => {
             </select>
           </div>
 
-          <div className="md:col-span-2">
-            <TextArea label="Task / Activity" value={params.taskActivity} onChange={(v: string) => setParams({ ...params, taskActivity: v })} placeholder="Describe the work being done..." />
-          </div>
-          <div className="md:col-span-2">
-            <TextArea label="Hazards Identified" value={params.hazards} onChange={(v: string) => setParams({ ...params, hazards: v })} placeholder="List potential risks..." />
-          </div>
-          <div className="md:col-span-2">
-            <TextArea label="Required PPE" value={params.ppe} onChange={(v: string) => setParams({ ...params, ppe: v })} placeholder="e.g. Hard hat, safety boots, high-vis vest..." />
+          {params.type === 'Incident Report' ? (
+            <>
+              <div className="md:col-span-2">
+                <TextArea label="Description of Incident" value={params.description} onChange={(v: string) => setParams({ ...params, description: v })} placeholder="Describe what happened..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Involved Parties" value={params.involvedParties} onChange={(v: string) => setParams({ ...params, involvedParties: v })} placeholder="Names and roles of people involved..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Immediate Actions Taken" value={params.immediateActions} onChange={(v: string) => setParams({ ...params, immediateActions: v })} placeholder="What was done immediately after the incident..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Witnesses" value={params.witnesses} onChange={(v: string) => setParams({ ...params, witnesses: v })} placeholder="Names and contact info of witnesses..." />
+              </div>
+            </>
+          ) : params.type === 'Job Hazard Analysis (JHA)' ? (
+            <>
+              <div className="md:col-span-2">
+                <TextArea label="Task / Activity" value={params.taskActivity} onChange={(v: string) => setParams({ ...params, taskActivity: v })} placeholder="Describe the work being done..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Hazards Identified" value={params.hazards} onChange={(v: string) => setParams({ ...params, hazards: v })} placeholder="List potential risks..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Existing Controls" value={params.existingControls} onChange={(v: string) => setParams({ ...params, existingControls: v })} placeholder="Controls currently in place..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Proposed Controls" value={params.proposedControls} onChange={(v: string) => setParams({ ...params, proposedControls: v })} placeholder="Additional controls needed..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Required PPE" value={params.ppe} onChange={(v: string) => setParams({ ...params, ppe: v })} placeholder="e.g. Hard hat, safety boots, high-vis vest..." />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="md:col-span-2">
+                <TextArea label="Task / Activity" value={params.taskActivity} onChange={(v: string) => setParams({ ...params, taskActivity: v })} placeholder="Describe the work being done..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Hazards Identified" value={params.hazards} onChange={(v: string) => setParams({ ...params, hazards: v })} placeholder="List potential risks..." />
+              </div>
+              <div className="md:col-span-2">
+                <TextArea label="Required PPE" value={params.ppe} onChange={(v: string) => setParams({ ...params, ppe: v })} placeholder="e.g. Hard hat, safety boots, high-vis vest..." />
+              </div>
+            </>
+          )}
+          <div className="md:col-span-2 pt-4 border-t border-zinc-100">
+            <h3 className="text-lg font-semibold text-zinc-800 mb-4">Update Existing Document (Optional)</h3>
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-700">Existing Document Content</label>
+                {!params.existingDocument ? (
+                  <DocumentUploader id="qhse-upload" onUpload={(text) => setParams({ ...params, existingDocument: text })} />
+                ) : (
+                  <div className="space-y-2">
+                    <TextArea value={params.existingDocument} onChange={(v: string) => setParams({ ...params, existingDocument: v })} placeholder="Extracted content will appear here..." />
+                    <Button variant="outline" className="text-xs py-1 px-3" onClick={() => setParams({ ...params, existingDocument: '' })}>Clear Document</Button>
+                  </div>
+                )}
+              </div>
+              <TextArea label="Update Instructions" value={params.updateInstructions} onChange={(v: string) => setParams({ ...params, updateInstructions: v })} placeholder="e.g. Update the hazards to include working near water..." />
+            </div>
           </div>
         </div>
         <div className="mt-8 pt-8 border-t border-zinc-100">
           <Button className="w-full py-4 text-lg" loading={loading} onClick={() => onGenerate(params)}>
-            Generate Professional {params.type}
+            {params.existingDocument ? `Update Professional ${params.type}` : `Generate Professional ${params.type}`}
           </Button>
         </div>
       </Card>
@@ -873,7 +1232,9 @@ const SOPGenerator = ({ onGenerate, loading }: any) => {
     numWorkers: '',
     ppe: '',
     date: new Date().toISOString().split('T')[0],
-    supervisorName: ''
+    supervisorName: '',
+    existingDocument: '',
+    updateInstructions: ''
   });
 
   return (
@@ -891,10 +1252,27 @@ const SOPGenerator = ({ onGenerate, loading }: any) => {
           </div>
           <Input label="Supervisor" value={params.supervisorName} onChange={(v: string) => setParams({ ...params, supervisorName: v })} />
           <Input label="Date" type="date" value={params.date} onChange={(v: string) => setParams({ ...params, date: v })} />
+          <div className="md:col-span-2 pt-4 border-t border-zinc-100">
+            <h3 className="text-lg font-semibold text-zinc-800 mb-4">Update Existing Document (Optional)</h3>
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-700">Existing SOP Content</label>
+                {!params.existingDocument ? (
+                  <DocumentUploader id="sop-upload" onUpload={(text) => setParams({ ...params, existingDocument: text })} />
+                ) : (
+                  <div className="space-y-2">
+                    <TextArea value={params.existingDocument} onChange={(v: string) => setParams({ ...params, existingDocument: v })} placeholder="Extracted content will appear here..." />
+                    <Button variant="outline" className="text-xs py-1 px-3" onClick={() => setParams({ ...params, existingDocument: '' })}>Clear Document</Button>
+                  </div>
+                )}
+              </div>
+              <TextArea label="Update Instructions" value={params.updateInstructions} onChange={(v: string) => setParams({ ...params, updateInstructions: v })} placeholder="e.g. Update the SOP to include new safety guidelines for the crane..." />
+            </div>
+          </div>
         </div>
         <div className="mt-8 pt-8 border-t border-zinc-100">
           <Button className="w-full py-4 text-lg" loading={loading} onClick={() => onGenerate(params)}>
-            Generate Professional SOP
+            {params.existingDocument ? 'Update Professional SOP' : 'Generate Professional SOP'}
           </Button>
         </div>
       </Card>
@@ -1035,10 +1413,80 @@ const PermitGenerator = ({ onGenerate, loading }: any) => {
   );
 };
 
+const PresentationGenerator = ({ onGenerate, loading }: any) => {
+  const [params, setParams] = useState({
+    topic: '',
+    audience: '',
+    numSlides: '10',
+    keyPoints: '',
+    formatStyle: 'Professional',
+    existingDocument: '',
+    updateInstructions: ''
+  });
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+      <div className="flex justify-between items-center">
+        <h2 className="text-3xl font-bold text-zinc-900">Presentation Generator</h2>
+      </div>
+      <Card className="p-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="md:col-span-2">
+            <Input label="Topic / Title" value={params.topic} onChange={(v: string) => setParams({ ...params, topic: v })} placeholder="e.g. Q3 Financial Results" />
+          </div>
+          <Input label="Target Audience" value={params.audience} onChange={(v: string) => setParams({ ...params, audience: v })} placeholder="e.g. Board of Directors, General Public" />
+          <Input label="Number of Slides" type="number" value={params.numSlides} onChange={(v: string) => setParams({ ...params, numSlides: v })} placeholder="e.g. 10" />
+          
+          <div className="space-y-1.5 md:col-span-2">
+            <label className="text-sm font-medium text-zinc-700">Format Style</label>
+            <select 
+              value={params.formatStyle} 
+              onChange={(e) => setParams({ ...params, formatStyle: e.target.value })}
+              className="w-full px-3 py-2 bg-white border border-zinc-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-zinc-900"
+            >
+              <option value="Professional">Professional</option>
+              <option value="Creative / Pitch">Creative / Pitch</option>
+              <option value="Educational / Training">Educational / Training</option>
+              <option value="Minimalist">Minimalist</option>
+            </select>
+          </div>
+
+          <div className="md:col-span-2">
+            <TextArea label="Key Points to Cover" value={params.keyPoints} onChange={(v: string) => setParams({ ...params, keyPoints: v })} placeholder="List the main points or outline..." />
+          </div>
+
+          <div className="md:col-span-2 pt-4 border-t border-zinc-100">
+            <h3 className="text-lg font-semibold text-zinc-800 mb-4">Redo Existing Presentation (Optional)</h3>
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-700">Upload Existing Presentation or Document</label>
+                {!params.existingDocument ? (
+                  <DocumentUploader id="presentation-upload" onUpload={(text) => setParams({ ...params, existingDocument: text })} />
+                ) : (
+                  <div className="space-y-2">
+                    <TextArea value={params.existingDocument} onChange={(v: string) => setParams({ ...params, existingDocument: v })} placeholder="Extracted content will appear here..." />
+                    <Button variant="outline" className="text-xs py-1 px-3" onClick={() => setParams({ ...params, existingDocument: '' })}>Clear Document</Button>
+                  </div>
+                )}
+              </div>
+              <TextArea label="Redesign Instructions" value={params.updateInstructions} onChange={(v: string) => setParams({ ...params, updateInstructions: v })} placeholder="e.g. Make it more professional, summarize the content into 10 slides..." />
+            </div>
+          </div>
+        </div>
+        <div className="mt-8 pt-8 border-t border-zinc-100">
+          <Button className="w-full py-4 text-lg" loading={loading} onClick={() => onGenerate(params)}>
+            Generate Presentation
+          </Button>
+        </div>
+      </Card>
+    </motion.div>
+  );
+};
+
 const AdminDashboard = ({ users, docs, onUpdateUser }: any) => {
   const [view, setView] = useState<'users' | 'docs'>('users');
 
-  const availablePermissions = ['QHSE', 'SOP', 'Project', 'Toolbox', 'Permit', 'Conversion'];
+  const availablePermissions = ['QHSE', 'SOP', 'Project', 'Toolbox', 'Permit', 'Presentation', 'Conversion'];
 
   const togglePermission = (user: UserProfile, perm: string) => {
     const current = user.permissions || [];
@@ -1153,22 +1601,30 @@ const PDFWorkspace = ({ onExtracted, loading, setLoading }: any) => {
 
     setLoading(true);
     try {
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      let fullText = "";
+      if (file.type === 'application/pdf') {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = "";
 
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map((item: any) => item.str).join(" ");
-        fullText += `--- Page ${i} ---\n${pageText}\n\n`;
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map((item: any) => item.str).join(" ");
+          fullText += `--- Page ${i} ---\n${pageText}\n\n`;
+        }
+
+        const markdown = await extractTextFromPDF(fullText);
+        onExtracted(markdown);
+      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx')) {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        onExtracted(result.value);
+      } else {
+        alert("Unsupported file format. Please upload a PDF or DOCX file.");
       }
-
-      const markdown = await extractTextFromPDF(fullText);
-      onExtracted(markdown);
     } catch (err) {
       console.error(err);
-      alert("Failed to process PDF.");
+      alert("Failed to process document.");
     } finally {
       setLoading(false);
     }
@@ -1176,19 +1632,19 @@ const PDFWorkspace = ({ onExtracted, loading, setLoading }: any) => {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
-      <h2 className="text-3xl font-bold text-zinc-900">PDF to Word & Editor</h2>
+      <h2 className="text-3xl font-bold text-zinc-900">Document to Word & Editor</h2>
       <Card className="p-12 text-center border-dashed border-2 border-zinc-200 bg-zinc-50/50">
         <div className="max-w-sm mx-auto space-y-4">
           <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center mx-auto shadow-sm">
             {loading ? <Loader2 className="w-8 h-8 text-emerald-600 animate-spin" /> : <FileUp className="w-8 h-8 text-emerald-600" />}
           </div>
           <div>
-            <h3 className="font-bold text-lg text-zinc-900">Enhanced PDF Processing</h3>
-            <p className="text-zinc-500">Upload your PDF to extract text, maintain tables, and edit content with AI.</p>
+            <h3 className="font-bold text-lg text-zinc-900">Enhanced Document Processing</h3>
+            <p className="text-zinc-500">Upload your PDF or Word document to extract text, maintain tables, and edit content with AI.</p>
           </div>
-          <input type="file" className="hidden" id="pdf-upload" accept=".pdf" onChange={handleFileUpload} />
+          <input type="file" className="hidden" id="pdf-upload" accept=".pdf,.docx" onChange={handleFileUpload} />
           <Button variant="secondary" className="w-full" loading={loading} onClick={() => document.getElementById('pdf-upload')?.click()}>
-            Select PDF File
+            Select Document File
           </Button>
         </div>
       </Card>
@@ -1204,11 +1660,22 @@ const Editor = ({ docData, onSave, onRewrite, loading }: any) => {
   const [showVersions, setShowVersions] = useState(false);
   const [versions, setVersions] = useState<any[]>([]);
   const [loadingVersions, setLoadingVersions] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     setContent(docData?.content || '');
     setTitle(docData?.title || 'New Document');
   }, [docData]);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy text', err);
+    }
+  };
 
   const loadVersions = async () => {
     if (!docData?.id) return;
@@ -1220,6 +1687,7 @@ const Editor = ({ docData, onSave, onRewrite, loading }: any) => {
       const v = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
       setVersions(v);
     } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, `documents/${docData.id}/versions`);
       console.error(err);
     } finally {
       setLoadingVersions(false);
@@ -1237,6 +1705,13 @@ const Editor = ({ docData, onSave, onRewrite, loading }: any) => {
           />
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" onClick={handleCopy}>
+            {copied ? <CheckCircle2 className="w-4 h-4 mr-2 text-emerald-600" /> : <Copy className="w-4 h-4 mr-2" />}
+            {copied ? 'Copied!' : 'Copy Text'}
+          </Button>
+          <Button variant="outline" onClick={() => downloadAsWord(content, title)}>
+            <Download className="w-4 h-4 mr-2" /> Word
+          </Button>
           {docData?.id && (
             <Button variant="outline" onClick={loadVersions}>
               <History className="w-4 h-4 mr-2" /> Versions

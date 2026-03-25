@@ -60,6 +60,10 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == resource.data.ownerId;
     }
 
+    function isParentDocOwner(docId) {
+      return isAuthenticated() && request.auth.uid == get(/databases/$(database)/documents/documents/$(docId)).data.ownerId;
+    }
+
     function isAdmin() {
       return isAuthenticated() &&
         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
@@ -133,8 +137,8 @@ service cloud.firestore {
       allow delete: if isDocOwner() || isAdmin();
 
       match /versions/{versionId} {
-        allow read: if isDocOwner() || isAdmin();
-        allow create: if isDocOwner() && isValidDocumentVersion(request.resource.data);
+        allow read: if isParentDocOwner(docId) || isAdmin();
+        allow create: if isParentDocOwner(docId) && isValidDocumentVersion(request.resource.data);
       }
     }
 
